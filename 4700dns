@@ -1,16 +1,27 @@
 #!/usr/bin/env -S python3 -u
 
 import argparse, socket, time, json, select, struct, sys, math
-from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A
+from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A, CNAME, NS, MX, TXT, RCODE
 
 class Server:
-    def __init__(self, root_ip, domain, port):
+    def __init__(self, root_ip, zone_file, port):
         self.root_ip = root_ip
-        self.domain = domain
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.bind(("0.0.0.0", port))
+        self.socket.bind(("127.0.0.1", port))
         self.port = self.socket.getsockname()[1]
+
+        self.origin = ""
+        self.zone = {}
+        self.TTL = 67
+
+        zone_text = open(zone_file).read()
+        for record in RR.fromZone(zone_text):
+            record_key = (str(record.rname).lower(), record.rtype)
+            self.zone.setdefault(record_key, []).append(record)
+            if record.rtype == QTYPE.SOA:
+                self.origin = str(record.rname).lower()
+                self.TTL = record.ttl
 
         self.log("Bound to port %d" % self.port)
 
