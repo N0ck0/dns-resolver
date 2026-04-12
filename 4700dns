@@ -33,19 +33,116 @@ class Server:
         self.log("Sending message:\n%s" % message)
         self.socket.sendto(message.pack(), addr)
 
+    def send_error(self, addr, request, error_code):
+        self.log("Sending Error...")
+        resp = request.reply()
+        resp.header.rcode = error_code
+        resp.header.ra = 1
+        self.send(addr, resp)
+
     def recv(self, socket):
         data, addr = socket.recvfrom(65535)
 
         # Unpack the DNS request
-        request = DNSRecord.parse(data)
-        self.log("Received message:\n%s" % request)
-
-        # YOU WILL NEED TO ACTUALLY DO SOMETHING SMART HERE
-        # WE ARE JUST REPLYING WITH A FIXED RESPONSE
-        response = request.reply()
-        response.add_answer(RR("abc.com", QTYPE.A, rdata=A("1.2.3.4"), ttl=60))       
+        try:
+            request = DNSRecord.parse(data)
+        except:
+            self.log("Invalid packet... Dropping")
+            return
         
-        self.send(addr, response)
+        self.log("Received message:\n%s" % request)
+        if len(request.questions) != 1:
+            self.send_error(addr, request, RCODE.SERVFAIL)
+            return
+        
+        query = request.questions[0]
+        query_domain = str(query.qname).lower()
+        query_type = query.qtype
+        wants_recursion = request.header.get_rd()
+
+        if query_domain == self.origin or query_domain.endswith("." + self.origin):
+            #under our domain
+            self.handle_authoritative(addr, request, query_domain, query_type)
+        else:
+            #not under our auth: recurse or error
+            if not wants_recursion:
+                self.send_error(addr, request, RCODE.SERVFAIL)
+                return
+            self.handle_recursive(addr, request, query_domain, query_type)
+
+
+    def handle_recursive(self, addr, request, q_domain, q_type):
+        return 6767
+    
+
+    def handle_authoritative(self, addr, request, q_domain, q_type):
+        reply = request.reply()
+        reply.header.aa = 1
+        reply.header.ra = 1
+
+        records = self.zone.get((q_domain, q_type))
+        
+        if records:
+            for record in records:
+                reply.add_answer(record)
+
+            #add glue records
+            if q_type == QTYPE.NS:
+                for ns_record in records:
+                    ns_target = str(ns_record.rdata.label).lower()
+                    glue = self.zone.get((ns_target, QTYPE.A), [])
+                    for record in glue:
+                        reply.add_ar(record)
+            self.send(addr, reply)
+            return
+        
+        #client asked for A/AAAA but only have CNAME record
+        if q_type == QTYPE.A or q_type == QTYPE.AAAA:
+            cname_records = self.zone.get((q_domain, QTYPE.CNAME), [])
+            if cname_records:
+                for record in cname_records:
+                    reply.add_answer(record)
+
+                #CNAME domain name
+                target = str(cname_records[0].rdata.label).lower()
+                target_records = self.zone.get((target, q_type), [])
+                for record in target_records:
+                    reply.add_answer(record)
+                self.send(addr, reply)
+                return
+        
+        #delegation checking
+        ns_name, delegation = self.get_delegation(q_domain)
+        if delegation:
+            reply.header.aa = 0
+            for dele in delegation:
+                reply.add_auth(dele)
+            
+            for ns_record in delegation:
+                ns_target = str(ns_record.rdata.label).lower()
+                glue = self.zone.get((ns_target, QTYPE.A), [])
+                for record in glue:
+                    reply.add_ar(record)
+
+            self.send(addr, reply)
+            return
+
+        reply.header.rcode = RCODE.NXDOMAIN
+        self.send(addr, reply)
+
+
+    def get_delegation(self, q_domain):
+        # Walk up the domain labels looking for an NS delegation
+        parts = q_domain.rstrip('.').split('.')
+        for i in range(len(parts)):
+            candidate = '.'.join(parts[i:]) + '.'
+            if candidate == self.origin:
+                break  # don't delegate to ourselves
+            records = self.zone.get((candidate, QTYPE.NS))
+            if records:
+                return candidate, records
+        return None, None
+
 
     def run(self):
         seq = 0
