@@ -1,5 +1,6 @@
 #!/usr/bin/env -S python3 -u
 
+import random
 import argparse, socket, time, json, select, struct, sys, math
 from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A, CNAME, NS, MX, TXT, RCODE
 
@@ -8,12 +9,24 @@ class Server:
         self.root_ip = root_ip
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.bind(("127.0.0.1", port))
+        self.socket.bind(("0.0.0.0", port))
         self.port = self.socket.getsockname()[1]
 
         self.origin = ""
+        self.TIMEOUT = 4
         self.zone = {}
         self.TTL = 67
+        self.pending ={
+            # pending[new_txid] = {
+            # "client_addr": addr,
+            # "client_txid": original_txid,
+            # "original_request": request,
+            # "current_server": "root_ip",
+            # "q_domain": "www.google.com.",
+            # "q_type": QTYPE.A,
+            # "time": 6.7 seconds
+            # }
+        }
 
         zone_text = open(zone_file).read()
         for record in RR.fromZone(zone_text):
@@ -31,6 +44,7 @@ class Server:
 
     def send(self, addr, message):
         self.log("Sending message:\n%s" % message)
+        message.header.rd = 1
         self.socket.sendto(message.pack(), addr)
 
     def send_error(self, addr, request, error_code):
@@ -51,6 +65,18 @@ class Server:
             return
         
         self.log("Received message:\n%s" % request)
+        if request.header.id in self.pending:
+            #upstream response
+            self.handle_upstream_response(request)
+        elif request.header.get_qr() == 0:
+            self.handle_query(addr, request)
+        else:
+            #unexpected response
+            return
+
+
+    def handle_query(self, addr, request):
+
         if len(request.questions) != 1:
             self.send_error(addr, request, RCODE.SERVFAIL)
             return
@@ -59,6 +85,8 @@ class Server:
         query_domain = str(query.qname).lower()
         query_type = query.qtype
         wants_recursion = request.header.get_rd()
+
+        self.log("query_domain=%r origin=%r" % (query_domain, self.origin))
 
         if query_domain == self.origin or query_domain.endswith("." + self.origin):
             #under our domain
@@ -72,8 +100,100 @@ class Server:
 
 
     def handle_recursive(self, addr, request, q_domain, q_type):
-        return 6767
-    
+        ques = request.questions[0]
+        new_id = self.add_pending_entry(addr, request, q_domain, q_type)
+        #build fresh query
+        upstream_query = DNSRecord.question(str(ques.qname), QTYPE[ques.qtype])
+        upstream_query.header.id = new_id
+        upstream_query.header.rd = 0
+
+        default_port = 60053
+        self.log("Sending upstream query id=%d for %s to %s" % (new_id, q_domain, self.root_ip))
+        self.send((self.root_ip, default_port), upstream_query)
+
+    def handle_upstream_response(self, response):
+        p = self.pending.pop(response.header.id)
+        response.header.tc = 0
+
+        #got full answer
+        if response.header.rcode == RCODE.NOERROR and len(response.rr) > 0:
+            response.header.id = p["client_txid"]
+            response.header.ra = 1
+            response.header.rd = 1
+            response.header.aa = 0
+            self.send(p["client_addr"], response)
+            return
+        
+        #received NS answer in auth section
+        if response.header.rcode == RCODE.NOERROR and p["q_type"] == QTYPE.NS:
+            auth_for_query = [record for record in response.auth 
+                            if str(record.rname).lower() == p["q_domain"] 
+                            and record.rtype == QTYPE.NS]
+            if auth_for_query:
+                response.header.id = p["client_txid"]
+                response.header.ra = 1
+                response.header.rd = 1
+                response.header.aa = 0
+                self.send(p["client_addr"], response)
+                return
+
+        #received error
+        if response.header.rcode in (RCODE.NXDOMAIN, RCODE.SERVFAIL):
+            response.header.id = p["client_txid"]
+            response.header.ra = 1
+            response.header.rd = 1
+            self.send(p["client_addr"], response)
+            return
+
+        #follow referral
+        next_ip = None
+        for ar in response.ar:
+            if ar.rtype == QTYPE.A:
+                next_ip = str(ar.rdata)
+                break
+
+        if next_ip is None:
+            #can't follow
+            self.send_error(p["client_addr"], p["original_request"], RCODE.SERVFAIL)
+            return
+
+        #follow hierarchy
+        new_id = self.add_pending_entry(
+            p["client_addr"], p["original_request"], p["q_domain"], p["q_type"]
+        )
+        upstream_query = DNSRecord.question(p["q_domain"], QTYPE[p["q_type"]])
+        upstream_query.header.id = new_id
+        upstream_query.header.rd = 0
+        self.send((next_ip, 60053), upstream_query)
+
+
+    def add_pending_entry(self, addr, request, q_domain, q_type):
+            # pending[new_txid] = {
+            # "client_addr": addr,
+            # "client_txid": original_txid,
+            # "original_request": request,
+            # "current_server": "root_ip",
+            # "q_domain": "www.google.com.",
+            # "q_type": QTYPE.A,
+            # "time": 6.7 seconds
+            # }
+            while True:
+                new_id = random.randint(0, 60000)
+                if new_id not in self.pending:
+                    break
+
+            self.pending[new_id] = {
+                "client_addr": addr,
+                "client_txid": request.header.id,
+                "original_request": request,
+                "current_server": self.root_ip,
+                "q_domain": q_domain,
+                "q_type": q_type,
+                "time": time.time()
+            }
+
+            return new_id
+       
 
     def handle_authoritative(self, addr, request, q_domain, q_type):
         reply = request.reply()
@@ -132,7 +252,6 @@ class Server:
 
 
     def get_delegation(self, q_domain):
-        # Walk up the domain labels looking for an NS delegation
         parts = q_domain.rstrip('.').split('.')
         for i in range(len(parts)):
             candidate = '.'.join(parts[i:]) + '.'
@@ -142,6 +261,15 @@ class Server:
             if records:
                 return candidate, records
         return None, None
+    
+
+    def check_timeouts(self):
+        now = time.time()
+        expired = [txid for txid, p in self.pending.items()
+                if now - p["time"] > self.TIMEOUT]
+        for txid in expired:
+            p = self.pending.pop(txid)
+            self.send_error(p["client_addr"], p["original_request"], RCODE.SERVFAIL)
 
 
     def run(self):
@@ -150,6 +278,7 @@ class Server:
             socks = select.select([self.socket], [], [], 0.1)[0]
             for conn in socks:
                 self.recv(conn)
+            self.check_timeouts()
 
         return
 
