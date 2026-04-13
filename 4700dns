@@ -16,6 +16,9 @@ class Server:
         self.TIMEOUT = 4
         self.zone = {}
         self.TTL = 67
+        self.cache = {
+            #cache[(domain, q_type)] -> {[records], expires_at}
+        }
         self.pending ={
             # pending[new_txid] = {
             # "client_addr": addr,
@@ -68,7 +71,7 @@ class Server:
         if request.header.id in self.pending:
             #upstream response
             self.handle_upstream_response(request)
-        elif request.header.get_qr() == 0:
+        elif request.header.get_qr() == 0:  
             self.handle_query(addr, request)
         else:
             #unexpected response
@@ -86,8 +89,6 @@ class Server:
         query_type = query.qtype
         wants_recursion = request.header.get_rd()
 
-        self.log("query_domain=%r origin=%r" % (query_domain, self.origin))
-
         if query_domain == self.origin or query_domain.endswith("." + self.origin):
             #under our domain
             self.handle_authoritative(addr, request, query_domain, query_type)
@@ -100,16 +101,32 @@ class Server:
 
 
     def handle_recursive(self, addr, request, q_domain, q_type):
+        #check for cached answer to query
+        cached = self.get_cache(q_domain, q_type)
+        if cached:
+            entry = self.cache.get((q_domain, q_type))
+            reply = request.reply()
+            reply.header.ra = 1
+            reply.header.aa = 0
+            remaining_ttl = max(1, int(entry["expires_at"] - time.time()))
+            for rr in cached:
+                #response should have updated ttl
+                rr.ttl = remaining_ttl
+                reply.add_answer(rr)
+            self.send(addr, reply)
+            return
+
+        #find best starting point
+        start_ip, start_bailiwick = self.find_best_nameserver(q_domain)
+
         ques = request.questions[0]
         new_id = self.add_pending_entry(addr, request, q_domain, q_type)
-        #build fresh query
+        self.pending[new_id]["bailiwick"] = start_bailiwick
+
         upstream_query = DNSRecord.question(str(ques.qname), QTYPE[ques.qtype])
         upstream_query.header.id = new_id
         upstream_query.header.rd = 0
-
-        default_port = 60053
-        self.log("Sending upstream query id=%d for %s to %s" % (new_id, q_domain, self.root_ip))
-        self.send((self.root_ip, default_port), upstream_query)
+        self.send((start_ip, 60053), upstream_query)
 
     def handle_upstream_response(self, response):
         p = self.pending.pop(response.header.id)
@@ -120,6 +137,12 @@ class Server:
         trusted_ar = self.filter_bailiwick(response.ar, bailiwick)
 
         all_answers = p.get("partial_answer", []) + list(trusted_answers)
+
+        if response.header.rcode == RCODE.NOERROR:
+            #aggressive caching
+            self.cache_records(trusted_answers)
+            self.cache_records(trusted_ar)
+            self.cache_records(trusted_auth)
 
         #got full answer
         if response.header.rcode == RCODE.NOERROR and len(response.rr) > 0:
@@ -135,12 +158,13 @@ class Server:
                         #record what has been found so far
                         self.pending[new_id]["partial_answer"] = all_answers
                         
+                        start_ip, start_bailiwick = self.find_best_nameserver(cname_target)
+                        self.pending[new_id]["bailiwick"] = start_bailiwick
                         upstream_query = DNSRecord.question(cname_target, "A")
                         upstream_query.header.id = new_id
                         upstream_query.header.rd = 0
-                        #restart from root
-                        self.send((self.root_ip, 60053), upstream_query)
-                        return
+                        self.send((start_ip, 60053), upstream_query)
+                        return              
 
                 reply = p["original_request"].reply()
                 reply.header.ra = 1
@@ -150,7 +174,7 @@ class Server:
                     reply.add_answer(rr)
                 self.send(p["client_addr"], reply)
                 return
-            elif len(response.rr) > 0:
+            else:
                 #received answers but not trusted (ans outside bailiwick)
                 reply = p["original_request"].reply()
                 reply.header.ra = 1
@@ -180,6 +204,7 @@ class Server:
         #received error
         if response.header.rcode in (RCODE.NXDOMAIN, RCODE.SERVFAIL):
             reply = p["original_request"].reply()
+            reply.header.rcode = response.header.rcode
             reply.header.ra = 1
             reply.header.aa = 0
             reply.header.tc = 0
@@ -249,6 +274,50 @@ class Server:
             }
 
             return new_id
+        
+    def cache_records(self, rr_list):
+        groups = {}
+        for rr in rr_list:
+            if rr.ttl <= 0:
+                continue
+            key = (str(rr.rname).lower(), rr.rtype)
+            groups.setdefault(key, []).append(rr)
+        
+        #use min ttl
+        for key, records in groups.items():
+            min_ttl = min(rr.ttl for rr in records)
+            expires = time.time() + min_ttl
+            existing = self.cache.get(key)
+            if not existing or expires >= existing["expires_at"]:
+                self.cache[key] = {"records": records, "expires_at": expires}
+
+    def get_cache(self, domain, qtype):
+        key = (domain.lower(), qtype)
+        entry = self.cache.get(key)
+        if not entry:
+            return None
+        if time.time() >= entry["expires_at"]:
+            del self.cache[key]
+            return None
+        return entry["records"]
+    
+    #returns best_ip, ns_bailiwick
+    def find_best_nameserver(self, q_domain):
+        #walk up labels looking for cache hit
+        labels = q_domain.rstrip('.').split('.')
+        for i in range(1, len(labels)):
+            candidate = '.'.join(labels[i:]) + '.'
+            ns_records = self.get_cache(candidate, QTYPE.NS)
+            if ns_records:
+                #got cache hit, look for ns A record to query
+                for ns_rr in ns_records:
+                    ns_target = str(ns_rr.rdata.label).lower()
+                    a_records = self.get_cache(ns_target, QTYPE.A)
+                    if a_records:
+                        ns_ip = str(a_records[0].rdata)
+                        return ns_ip, candidate  # ip, bailiwick
+        #not cached, begin from root
+        return self.root_ip, "."
        
 
     def handle_authoritative(self, addr, request, q_domain, q_type):
@@ -328,7 +397,6 @@ class Server:
     def get_bailiwick(self, response):
         for record in response.auth:
             if record.rtype == QTYPE.NS:
-                self.log("GOT BAILIWICK:  " + str(record.rname).lower())
                 return str(record.rname).lower()
         return None
     
