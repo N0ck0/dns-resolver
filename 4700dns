@@ -115,13 +115,35 @@ class Server:
         p = self.pending.pop(response.header.id)
         response.header.tc = 0
 
+        all_answers = p.get("partial_answer", []) + list(response.rr)
+
         #got full answer
         if response.header.rcode == RCODE.NOERROR and len(response.rr) > 0:
-            response.header.id = p["client_txid"]
-            response.header.ra = 1
-            response.header.rd = 1
-            response.header.aa = 0
-            self.send(p["client_addr"], response)
+            if p["q_type"] == QTYPE.A:
+                last_rr = all_answers[-1]
+                if last_rr.rtype == QTYPE.CNAME:
+                    #unresolved answer
+                    cname_target = str(last_rr.rdata.label).lower()
+                    new_id = self.add_pending_entry(
+                        p["client_addr"], p["original_request"], cname_target, QTYPE.A
+                    )
+                    #record what has been found so far
+                    self.pending[new_id]["partial_answer"] = all_answers
+                    
+                    upstream_query = DNSRecord.question(cname_target, "A")
+                    upstream_query.header.id = new_id
+                    upstream_query.header.rd = 0
+                    #restart from root
+                    self.send((self.root_ip, 60053), upstream_query)
+                    return
+
+            reply = p["original_request"].reply()
+            reply.header.ra = 1
+            reply.header.aa = 0
+            reply.header.tc = 0
+            for rr in all_answers:
+                reply.add_answer(rr)
+            self.send(p["client_addr"], reply)
             return
         
         #received NS answer in auth section
@@ -130,19 +152,24 @@ class Server:
                             if str(record.rname).lower() == p["q_domain"] 
                             and record.rtype == QTYPE.NS]
             if auth_for_query:
-                response.header.id = p["client_txid"]
-                response.header.ra = 1
-                response.header.rd = 1
-                response.header.aa = 0
-                self.send(p["client_addr"], response)
+                reply = p["original_request"].reply()
+                reply.header.ra = 1
+                reply.header.aa = 0
+                reply.header.tc = 0
+                for rr in all_answers:
+                    reply.add_answer(rr)
+                self.send(p["client_addr"], reply)
                 return
 
         #received error
         if response.header.rcode in (RCODE.NXDOMAIN, RCODE.SERVFAIL):
-            response.header.id = p["client_txid"]
-            response.header.ra = 1
-            response.header.rd = 1
-            self.send(p["client_addr"], response)
+            reply = p["original_request"].reply()
+            reply.header.ra = 1
+            reply.header.aa = 0
+            reply.header.tc = 0
+            for rr in all_answers:
+                reply.add_answer(rr)
+            self.send(p["client_addr"], reply)
             return
 
         #follow referral
@@ -161,6 +188,8 @@ class Server:
         new_id = self.add_pending_entry(
             p["client_addr"], p["original_request"], p["q_domain"], p["q_type"]
         )
+        if "partial_answer" in p:
+            self.pending[new_id]["partial_answer"] = p["partial_answer"]
         upstream_query = DNSRecord.question(p["q_domain"], QTYPE[p["q_type"]])
         upstream_query.header.id = new_id
         upstream_query.header.rd = 0
@@ -253,7 +282,7 @@ class Server:
 
     def get_delegation(self, q_domain):
         parts = q_domain.rstrip('.').split('.')
-        for i in range(len(parts)):
+        for i in range(1, len(parts)):
             candidate = '.'.join(parts[i:]) + '.'
             if candidate == self.origin:
                 break  # don't delegate to ourselves
