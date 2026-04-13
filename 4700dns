@@ -13,7 +13,7 @@ class Server:
         self.port = self.socket.getsockname()[1]
 
         self.origin = ""
-        self.TIMEOUT = 4
+        self.TIMEOUT = 2
         self.zone = {}
         self.TTL = 67
         self.cache = {
