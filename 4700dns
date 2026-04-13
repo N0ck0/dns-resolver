@@ -113,6 +113,15 @@ class Server:
                 #response should have updated ttl
                 rr.ttl = remaining_ttl
                 reply.add_answer(rr)
+            # if NS query, include glue from cache
+            if q_type == QTYPE.NS:
+                for ns_rr in cached:
+                    ns_target = str(ns_rr.rdata.label).lower()
+                    glue = self.get_cache(ns_target, QTYPE.A)
+                    if glue:
+                        for a_rr in glue:
+                            a_rr.ttl = remaining_ttl
+                            reply.add_ar(a_rr)
             self.send(addr, reply)
             return
 
@@ -172,6 +181,8 @@ class Server:
                 reply.header.tc = 0
                 for rr in all_answers:
                     reply.add_answer(rr)
+                for rr in trusted_ar:  # add this
+                    reply.add_ar(rr)
                 self.send(p["client_addr"], reply)
                 return
             else:
