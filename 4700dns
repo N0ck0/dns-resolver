@@ -114,41 +114,53 @@ class Server:
     def handle_upstream_response(self, response):
         p = self.pending.pop(response.header.id)
         response.header.tc = 0
+        bailiwick = p["bailiwick"]
+        trusted_answers = self.filter_bailiwick(response.rr, bailiwick)
+        trusted_auth = self.filter_bailiwick(response.auth, bailiwick)
+        trusted_ar = self.filter_bailiwick(response.ar, bailiwick)
 
-        all_answers = p.get("partial_answer", []) + list(response.rr)
+        all_answers = p.get("partial_answer", []) + list(trusted_answers)
 
         #got full answer
         if response.header.rcode == RCODE.NOERROR and len(response.rr) > 0:
-            if p["q_type"] == QTYPE.A:
-                last_rr = all_answers[-1]
-                if last_rr.rtype == QTYPE.CNAME:
-                    #unresolved answer
-                    cname_target = str(last_rr.rdata.label).lower()
-                    new_id = self.add_pending_entry(
-                        p["client_addr"], p["original_request"], cname_target, QTYPE.A
-                    )
-                    #record what has been found so far
-                    self.pending[new_id]["partial_answer"] = all_answers
-                    
-                    upstream_query = DNSRecord.question(cname_target, "A")
-                    upstream_query.header.id = new_id
-                    upstream_query.header.rd = 0
-                    #restart from root
-                    self.send((self.root_ip, 60053), upstream_query)
-                    return
+            if len(trusted_answers) > 0:
+                if p["q_type"] == QTYPE.A:
+                    last_rr = all_answers[-1]
+                    if last_rr.rtype == QTYPE.CNAME:
+                        #unresolved answer
+                        cname_target = str(last_rr.rdata.label).lower()
+                        new_id = self.add_pending_entry(
+                            p["client_addr"], p["original_request"], cname_target, QTYPE.A
+                        )
+                        #record what has been found so far
+                        self.pending[new_id]["partial_answer"] = all_answers
+                        
+                        upstream_query = DNSRecord.question(cname_target, "A")
+                        upstream_query.header.id = new_id
+                        upstream_query.header.rd = 0
+                        #restart from root
+                        self.send((self.root_ip, 60053), upstream_query)
+                        return
 
-            reply = p["original_request"].reply()
-            reply.header.ra = 1
-            reply.header.aa = 0
-            reply.header.tc = 0
-            for rr in all_answers:
-                reply.add_answer(rr)
-            self.send(p["client_addr"], reply)
-            return
+                reply = p["original_request"].reply()
+                reply.header.ra = 1
+                reply.header.aa = 0
+                reply.header.tc = 0
+                for rr in all_answers:
+                    reply.add_answer(rr)
+                self.send(p["client_addr"], reply)
+                return
+            elif len(response.rr) > 0:
+                #received answers but not trusted (ans outside bailiwick)
+                reply = p["original_request"].reply()
+                reply.header.ra = 1
+                reply.header.aa = 0
+                self.send(p["client_addr"], reply)
+                return
         
         #received NS answer in auth section
         if response.header.rcode == RCODE.NOERROR and p["q_type"] == QTYPE.NS:
-            auth_for_query = [record for record in response.auth 
+            auth_for_query = [record for record in trusted_auth 
                             if str(record.rname).lower() == p["q_domain"] 
                             and record.rtype == QTYPE.NS]
             if auth_for_query:
@@ -156,8 +168,12 @@ class Server:
                 reply.header.ra = 1
                 reply.header.aa = 0
                 reply.header.tc = 0
-                for rr in all_answers:
+                for rr in auth_for_query:
+                    #answer with NS records
                     reply.add_answer(rr)
+                for rr in trusted_ar:
+                    #include glue A records
+                    reply.add_ar(rr)
                 self.send(p["client_addr"], reply)
                 return
 
@@ -167,17 +183,23 @@ class Server:
             reply.header.ra = 1
             reply.header.aa = 0
             reply.header.tc = 0
-            for rr in all_answers:
-                reply.add_answer(rr)
             self.send(p["client_addr"], reply)
             return
 
         #follow referral
         next_ip = None
-        for ar in response.ar:
+        for ar in trusted_ar:
             if ar.rtype == QTYPE.A:
                 next_ip = str(ar.rdata)
                 break
+        
+        if next_ip == None and len(response.ar) > 0:
+            #bailiwick failure
+            reply = p["original_request"].reply()
+            reply.header.ra = 1
+            reply.header.aa = 0
+            self.send(p["client_addr"], reply)
+            return
 
         if next_ip is None:
             #can't follow
@@ -190,6 +212,9 @@ class Server:
         )
         if "partial_answer" in p:
             self.pending[new_id]["partial_answer"] = p["partial_answer"]
+        new_bailiwick = self.get_bailiwick(response)
+        if new_bailiwick:
+            self.pending[new_id]["bailiwick"] = new_bailiwick
         upstream_query = DNSRecord.question(p["q_domain"], QTYPE[p["q_type"]])
         upstream_query.header.id = new_id
         upstream_query.header.rd = 0
@@ -205,6 +230,7 @@ class Server:
             # "q_domain": "www.google.com.",
             # "q_type": QTYPE.A,
             # "time": 6.7 seconds
+            # "bailiwick": ".foo."
             # }
             while True:
                 new_id = random.randint(0, 60000)
@@ -218,7 +244,8 @@ class Server:
                 "current_server": self.root_ip,
                 "q_domain": q_domain,
                 "q_type": q_type,
-                "time": time.time()
+                "time": time.time(),
+                "bailiwick": "."
             }
 
             return new_id
@@ -291,7 +318,23 @@ class Server:
                 return candidate, records
         return None, None
     
-
+    def in_bailiwick(self, name, bailiwick):
+        if bailiwick == ".":
+            return True  #root is authoritative for everything
+        name = name.rstrip('.')
+        bailiwick = bailiwick.rstrip('.')
+        return name == bailiwick or name.endswith('.' + bailiwick)
+    
+    def get_bailiwick(self, response):
+        for record in response.auth:
+            if record.rtype == QTYPE.NS:
+                self.log("GOT BAILIWICK:  " + str(record.rname).lower())
+                return str(record.rname).lower()
+        return None
+    
+    def filter_bailiwick(self, records, bailiwick):
+        return [rr for rr in records if self.in_bailiwick(str(rr.rname).lower(), bailiwick)]
+    
     def check_timeouts(self):
         now = time.time()
         expired = [txid for txid, p in self.pending.items()
